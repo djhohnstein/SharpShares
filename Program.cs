@@ -89,7 +89,8 @@ namespace SharpShares
                 {
                     SHARE_INFO_1 shi1 = (SHARE_INFO_1)Marshal.PtrToStructure(currentPtr, typeof(SHARE_INFO_1));
                     ShareInfos.Add(shi1);
-                    currentPtr += nStructSize;
+
+                    currentPtr = (IntPtr)(currentPtr.ToInt64() + nStructSize);
                 }
                 NetApiBufferFree(bufPtr);
                 return ShareInfos.ToArray();
