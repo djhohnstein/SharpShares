@@ -7,12 +7,17 @@ using System.DirectoryServices;
 using System.Security.Principal;
 using System.DirectoryServices.ActiveDirectory;
 using System.Runtime.InteropServices;
-
+using System.Threading;
 
 namespace SharpShares
 {
     class Program
     {
+        public static Semaphore MaxThreads { get; set; }
+
+        [DllImport("Netapi32.dll", SetLastError = true)]
+        public static extern int NetWkstaGetInfo(string servername, int level, out IntPtr bufptr);
+
         [DllImport("Netapi32.dll", SetLastError = true)]
         static extern int NetApiBufferFree(IntPtr Buffer);
 
@@ -26,6 +31,16 @@ namespace SharpShares
             ref int totalentries,
             ref int resume_handle
         );
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct WKSTA_INFO_100
+        {
+            public int platform_id;
+            public string computer_name;
+            public string lan_group;
+            public int ver_major;
+            public int ver_minor;
+        }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct SHARE_INFO_0
@@ -122,13 +137,20 @@ namespace SharpShares
         {
             foreach (string computer in computers)
             {
-                IPAddress[] ips = System.Net.Dns.GetHostAddresses(computer);
-                foreach (IPAddress ip in ips)
+                try
                 {
-                    if (!ip.ToString().Contains(":"))
+                    IPAddress[] ips = System.Net.Dns.GetHostAddresses(computer);
+                    foreach (IPAddress ip in ips)
                     {
-                        Console.WriteLine("{0}: {1}", computer, ip);
+                        if (!ip.ToString().Contains(":"))
+                        {
+                            Console.WriteLine("{0}: {1}", computer, ip);
+                        }
                     }
+                }
+                catch(Exception ex)
+                {
+                    //Console.WriteLine("[X] ERROR: {0}", ex.Message);
                 }
             }
         }
@@ -182,70 +204,154 @@ namespace SharpShares
             return computerNames;
         }
 
-        public static void GetShares(List<string> computers)
+        public static void GetComputerShares(string computer, bool publicOnly = false)
         {
             string[] errors = { "ERROR=53", "ERROR=5" };
-            foreach(string computer in computers)
+            SHARE_INFO_1[] computerShares = EnumNetShares(computer);
+            if (computerShares.Length > 0)
             {
-                SHARE_INFO_1[] computerShares = EnumNetShares(computer);
-                if (computerShares.Length > 0)
+                List<string> readableShares = new List<string>();
+                List<string> unauthorizedShares = new List<string>();
+                foreach (SHARE_INFO_1 share in computerShares)
                 {
-                    List<string> readableShares = new List<string>();
-                    List<string> unauthorizedShares = new List<string>();
-                    foreach(SHARE_INFO_1 share in computerShares)
+                    try
                     {
-                        try
+                        string path = String.Format("\\\\{0}\\{1}", computer, share.shi1_netname);
+                        var files = System.IO.Directory.GetFiles(path);
+                        readableShares.Add(share.shi1_netname);
+                    }
+                    catch
+                    {
+                        if (!errors.Contains(share.shi1_netname))
                         {
-                            string path = String.Format("\\\\{0}\\{1}", computer, share.shi1_netname);
-                            var files = System.IO.Directory.GetFiles(path);
-                            readableShares.Add(share.shi1_netname);
-                        }
-                        catch
-                        {
-                            if (!errors.Contains(share.shi1_netname))
-                            {
-                                unauthorizedShares.Add(share.shi1_netname);
-                            }
+                            unauthorizedShares.Add(share.shi1_netname);
                         }
                     }
-                    if (unauthorizedShares.Count > 0 || readableShares.Count > 0)
+                }
+                if (unauthorizedShares.Count > 0 || readableShares.Count > 0)
+                {
+                    if (publicOnly)
                     {
-                        Console.WriteLine("Shares for {0}:", computer);
+                        if (readableShares.Count > 0)
+                        {
+                            string output = string.Format("Shares for {0}:\n", computer);
+                            output += "\t[--- Listable Shares ---]\n";
+                            //Console.WriteLine("Shares for {0}:", computer);
+                            //Console.WriteLine("\t[--- Listable Shares ---]");
+                            foreach (string share in readableShares)
+                            {
+                                output += string.Format("\t\t{0}\n", share);
+                            }
+                            Console.WriteLine(output);
+                        }
+                    }
+                    else
+                    {
+                        string output = string.Format("Shares for {0}:\n", computer);
                         if (unauthorizedShares.Count > 0)
                         {
-                            Console.WriteLine("\t[--- Unreadable Shares ---]");
+                            output += "\t[--- Unreadable Shares ---]\n";
                             foreach (string share in unauthorizedShares)
                             {
-                                Console.WriteLine("\t\t{0}", share);
+                                output += string.Format("\t\t{0}\n", share);
                             }
                         }
                         if (readableShares.Count > 0)
                         {
-                            Console.WriteLine("\t[--- Listable Shares ---]");
+                            output += "\t[--- Listable Shares ---]\n";
                             foreach (string share in readableShares)
                             {
-                                Console.WriteLine("\t\t{0}", share);
+                                output += string.Format("\t\t{0}", share);
                             }
                         }
+                        Console.WriteLine(output);
                     }
                 }
             }
         }
 
+        public static void GetAllShares(List<string> computers, bool publicOnly = false)
+        {
+            List<Thread> runningThreads = new List<Thread>();
+            foreach(string computer in computers)
+            {
+                Thread t = new Thread(() => GetComputerShares(computer, publicOnly));
+                t.Start();
+                runningThreads.Add(t);
+            }
+            foreach(Thread t in runningThreads)
+            {
+                t.Join();
+            }
+        }
+
+        static void GetComputerVersions(List<string> computers)
+        {
+            foreach(string computer in computers)
+            {
+                Console.WriteLine("Comptuer: {0}", computer);
+                string serverName = String.Format("\\\\{0}", computer);
+                Console.WriteLine(serverName);
+                IntPtr buffer;
+                var ret = NetWkstaGetInfo(serverName, 100, out buffer);
+                var strut_size = Marshal.SizeOf(typeof(WKSTA_INFO_100));
+                Console.WriteLine("Ret is:");
+                Console.WriteLine(ret);
+                if (ret == NERR_Success)
+                {
+                    var info = (WKSTA_INFO_100)Marshal.PtrToStructure(buffer, typeof(WKSTA_INFO_100));
+                    if (!string.IsNullOrEmpty(info.computer_name))
+                    {
+                        Console.WriteLine(info.computer_name);
+                        Console.WriteLine(info.platform_id);
+                        Console.WriteLine(info.ver_major);
+                        Console.WriteLine(info.ver_minor);
+                        Console.WriteLine(info.lan_group);
+                    }
+                }
+            }
+        }
+        
         static void Main(string[] args)
         {
             var computers = GetComputers();
+            Console.WriteLine("[*] Parsed {0} computer objects.", computers.Count);
+            ThreadPool.SetMaxThreads(10, 10);
             if (args.Contains("ips"))
             {
                 GetComputerAddresses(computers);
             }
             else if (args.Contains("shares"))
             {
-                GetShares(computers);
+                bool pubOnly = false;
+                if (args.Contains("--public-only"))
+                {
+                    pubOnly = true;
+                }
+                if (args.Length < 2 || (args.Length == 2 && pubOnly))
+                {
+
+                    GetAllShares(computers, pubOnly);
+                }
+                else if (args[1] == "--public-only")
+                {
+                    GetAllShares(computers, true);
+                }
+                else
+                {
+                    Console.WriteLine("Attempting to enumerate shares for: {0}", args[1]);
+                    List<string> comps = new List<string>();
+                    comps.Add(args[1]);
+                    GetAllShares(comps, pubOnly);
+                }
+            }
+            else if (args.Contains("versions"))
+            {
+                GetComputerVersions(computers);
             }
             else
             {
-                Console.WriteLine("Error: Not enough arguments. Please pass \"ip\" or \"shares\".");
+                Console.WriteLine("Error: Not enough arguments. Please pass \"ips\" or \"shares\".");
             }
         }
     }
