@@ -5,9 +5,12 @@ using System.Text;
 using System.Net;
 using System.DirectoryServices;
 using System.Security.Principal;
+using System.Security;
 using System.DirectoryServices.ActiveDirectory;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Security.Permissions;
+using System.Security.AccessControl;
 
 namespace SharpShares
 {
@@ -116,8 +119,6 @@ namespace SharpShares
             }
         }
 
-
-        
         public static List<DomainController> GetDomainControllers()
         {
             List<DomainController> domainControllers = new List<DomainController>();
@@ -148,9 +149,8 @@ namespace SharpShares
                         }
                     }
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
-                    //Console.WriteLine("[X] ERROR: {0}", ex.Message);
                 }
             }
         }
@@ -204,82 +204,165 @@ namespace SharpShares
             return computerNames;
         }
 
-        public static void GetComputerShares(string computer, bool publicOnly = false)
+        public static bool DirectoryHasPermission(string DirectoryPath, FileSystemRights AccessRight)
+        {
+            if (string.IsNullOrEmpty(DirectoryPath)) return false;
+
+            try
+            {
+                AuthorizationRuleCollection rules = System.IO.Directory.GetAccessControl(DirectoryPath).GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier));
+                WindowsIdentity identity = WindowsIdentity.GetCurrent();
+
+                foreach (FileSystemAccessRule rule in rules)
+                {
+                    if (identity.Groups.Contains(rule.IdentityReference) || identity.Owner.Equals(rule.IdentityReference))
+                    {
+                        if ((AccessRight & rule.FileSystemRights) > 0)
+                        {
+                            if (rule.AccessControlType == AccessControlType.Allow)
+                                return true;
+                        }
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return false;
+        }
+
+        public class SharpShareResult
+        {
+            public string path { get; set; }
+            public string shortname { get; set; }
+
+            public bool writeable { get; set; }
+
+            public bool readable { get; set; }
+
+            public bool inaccessible { get; set; }
+
+            public SharpShareResult(string path_arg, string shortname_arg)
+            {
+
+                writeable = false;
+                readable = false;
+                inaccessible = true;
+                path = path_arg;
+                shortname = shortname_arg;
+            }
+            public void set_writeable()
+            {
+                writeable = true;
+                inaccessible = false;
+            }
+            public void set_readable()
+            {
+                readable = true;
+                inaccessible = false;
+            }
+            public string print_grepable()
+            {
+                string return_line = "SharpShare," + path;
+                if (writeable)
+                {
+                    return_line += ",write";
+                }
+                if (readable)
+                {
+                    return_line += ",read";
+                }
+
+                return return_line;
+            }
+        }
+
+        public static void GetComputerShares(string computer, bool publicOnly = false, bool grepable = true)
         {
             string[] errors = { "ERROR=53", "ERROR=5" };
             SHARE_INFO_1[] computerShares = EnumNetShares(computer);
             if (computerShares.Length > 0)
             {
-                List<string> readableShares = new List<string>();
-                List<string> unauthorizedShares = new List<string>();
+                List<SharpShareResult> results = new List<SharpShareResult>();
                 foreach (SHARE_INFO_1 share in computerShares)
                 {
-                    try
+                    string path = String.Format("\\\\{0}\\{1}", computer, share.shi1_netname);
+
+                    SharpShareResult next_result = new SharpShareResult(path, share.shi1_netname);
+
+                    if (DirectoryHasPermission(path, FileSystemRights.Read))
                     {
-                        string path = String.Format("\\\\{0}\\{1}", computer, share.shi1_netname);
-                        var files = System.IO.Directory.GetFiles(path);
-                        readableShares.Add(share.shi1_netname);
+                        next_result.set_readable();
                     }
-                    catch
+                    if (DirectoryHasPermission(path, FileSystemRights.Write))
                     {
-                        if (!errors.Contains(share.shi1_netname))
-                        {
-                            unauthorizedShares.Add(share.shi1_netname);
-                        }
+                        next_result.set_writeable();
+                    }
+                    results.Add(next_result);
+                }
+                if (grepable)
+                {
+
+                    foreach (SharpShareResult result in results)
+                    {
+                        Console.WriteLine(result.print_grepable());
                     }
                 }
-                if (unauthorizedShares.Count > 0 || readableShares.Count > 0)
+                else
                 {
-                    if (publicOnly)
+
+                    string output = string.Format("Shares for {0}:\n", computer);
+
+                    string read_output = "";
+                    string write_output = "";
+                    string denied_output = "";
+                    foreach (SharpShareResult result in results)
                     {
-                        if (readableShares.Count > 0)
+                        if (result.writeable)
                         {
-                            string output = string.Format("Shares for {0}:\n", computer);
-                            output += "\t[--- Listable Shares ---]\n";
-                            //Console.WriteLine("Shares for {0}:", computer);
-                            //Console.WriteLine("\t[--- Listable Shares ---]");
-                            foreach (string share in readableShares)
-                            {
-                                output += string.Format("\t\t{0}\n", share);
-                            }
-                            Console.WriteLine(output);
+                            write_output += string.Format("\t\t{0}\n", result.shortname);
+
+                        }
+                        if (result.readable)
+                        {
+                            read_output += string.Format("\t\t{0}\n", result.shortname);
+                        }
+                        if (result.inaccessible && !(publicOnly))
+                        {
+                            denied_output += string.Format("\t\t{0}\n", result.shortname);
                         }
                     }
-                    else
+                    if (!String.IsNullOrEmpty(write_output))
                     {
-                        string output = string.Format("Shares for {0}:\n", computer);
-                        if (unauthorizedShares.Count > 0)
-                        {
-                            output += "\t[--- Unreadable Shares ---]\n";
-                            foreach (string share in unauthorizedShares)
-                            {
-                                output += string.Format("\t\t{0}\n", share);
-                            }
-                        }
-                        if (readableShares.Count > 0)
-                        {
-                            output += "\t[--- Listable Shares ---]\n";
-                            foreach (string share in readableShares)
-                            {
-                                output += string.Format("\t\t{0}", share);
-                            }
-                        }
-                        Console.WriteLine(output);
+                        write_output = "\t[--- Writeable Shares ---]\n" + write_output;
+
                     }
+                    if (!String.IsNullOrEmpty(read_output))
+                    {
+                        read_output = "\t[--- Listable Shares ---]\n" + read_output;
+
+                    }
+                    if (!String.IsNullOrEmpty(denied_output))
+                    {
+                        denied_output = "\t[--- Unreadable Shares ---]\n" + denied_output;
+                    }
+                    output += read_output + write_output + denied_output;
+                    Console.WriteLine(output);
+
                 }
             }
         }
 
-        public static void GetAllShares(List<string> computers, bool publicOnly = false)
+        public static void GetAllShares(List<string> computers, bool publicOnly = false, bool grepable = false)
         {
             List<Thread> runningThreads = new List<Thread>();
-            foreach(string computer in computers)
+            foreach (string computer in computers)
             {
-                Thread t = new Thread(() => GetComputerShares(computer, publicOnly));
+                Thread t = new Thread(() => GetComputerShares(computer, publicOnly, grepable));
                 t.Start();
                 runningThreads.Add(t);
             }
-            foreach(Thread t in runningThreads)
+            foreach (Thread t in runningThreads)
             {
                 t.Join();
             }
@@ -287,9 +370,9 @@ namespace SharpShares
 
         static void GetComputerVersions(List<string> computers)
         {
-            foreach(string computer in computers)
+            foreach (string computer in computers)
             {
-                Console.WriteLine("Comptuer: {0}", computer);
+                Console.WriteLine("Computer: {0}", computer);
                 string serverName = String.Format("\\\\{0}", computer);
                 Console.WriteLine(serverName);
                 IntPtr buffer;
@@ -311,47 +394,146 @@ namespace SharpShares
                 }
             }
         }
-        
+
         static void Main(string[] args)
         {
-            var computers = GetComputers();
-            Console.WriteLine("[*] Parsed {0} computer objects.", computers.Count);
-            ThreadPool.SetMaxThreads(10, 10);
-            if (args.Contains("ips"))
-            {
-                GetComputerAddresses(computers);
-            }
-            else if (args.Contains("shares"))
-            {
-                bool pubOnly = false;
-                if (args.Contains("--public-only"))
-                {
-                    pubOnly = true;
-                }
-                if (args.Length < 2 || (args.Length == 2 && pubOnly))
-                {
+            bool pubOnly = false;
+            bool grepable = false;
+            int argcount = 0;
+            string mode = "";
+            bool mode_selected = false;
+            bool pos_arg_seen = false;
+            bool flag_seen = false;
+            bool is_flag = false;
+            bool is_pos_arg = false;
+            List<string> computers;
 
-                    GetAllShares(computers, pubOnly);
-                }
-                else if (args[1] == "--public-only")
+            string[] valid_flags =
+            {
+
+                "--shares",
+                "--versions",
+                "--ips",
+                "--grepable",
+                "--public-only",
+            };
+
+            // set thread pool early
+            ThreadPool.SetMaxThreads(10, 10);
+
+            // ensure that: (1) user has not placed any positional arguments before flags
+            // easy to do: we should never see a positional argument appear before
+            // a flag in the sequence (2) all flags are valid
+
+            foreach (string a in args)
+            {
+                // check if a is a flag
+                if (a.StartsWith("--"))
                 {
-                    GetAllShares(computers, true);
+                    flag_seen = true;
+                    if (pos_arg_seen)
+                    {
+                        Console.WriteLine("Error: Positional arguments should come after flags. Valid example: --shares example.com specterops.io");
+                        return;
+                    }
+
+                    // check if valid flag
+                    if (Array.IndexOf(valid_flags, a) < 0)
+                    {
+                        Console.WriteLine("Error: invalid flag: " + a);
+                        return;
+                    }
                 }
                 else
                 {
-                    Console.WriteLine("Attempting to enumerate shares for: {0}", args[1]);
-                    List<string> comps = new List<string>();
-                    comps.Add(args[1]);
-                    GetAllShares(comps, pubOnly);
+                    pos_arg_seen = true;
                 }
             }
-            else if (args.Contains("versions"))
+
+            // process mode flags - note: there should only be ONE of these
+            if (args.Contains("--shares"))
             {
-                GetComputerVersions(computers);
+                mode = "shares";
+                if (mode_selected == true)
+                {
+                    Console.WriteLine("Error: please choose exactly one of the following modes: --shares, --versions, --ips");
+                    return;
+                }
+                argcount++;
+                mode_selected = true;
+            }
+            if (args.Contains("--versions"))
+            {
+                mode = "versions";
+                if (mode_selected == true)
+                {
+                    Console.WriteLine("Error: please choose exactly one of the following modes: --shares, --versions, --ips");
+                    return;
+                }
+                argcount++;
+                mode_selected = true;
+            }
+            if (args.Contains("--ips"))
+            {
+                mode = "ips";
+                if (mode_selected == true)
+                {
+                    Console.WriteLine("Error: please choose exactly one of the following modes: --shares, --versions, --ips");
+                    return;
+                }
+                argcount++;
+                mode_selected = true;
+            }
+
+            // process flags - any number of these can be selected
+            if (args.Contains("--public-only"))
+            {
+                pubOnly = true;
+                argcount++;
+            }
+            if (args.Contains("--grepable"))
+            {
+                grepable = true;
+                argcount++;
+            }
+
+            // process positional arguments - check if user has manually specified a list of computers
+            if (args.Length == argcount)
+            {
+
+                // if we end up here, it means that we've processed every command line argument
+                // and the user has NOT provided a list of computers. Make call to GetComputers()
+                // to obtain one.
+                computers = GetComputers();
             }
             else
             {
-                Console.WriteLine("Error: Not enough arguments. Please pass \"ips\" or \"shares\".");
+
+                // otherwise, the user has passed a list of computers via the CLI. Read them.
+                computers = new List<string>();
+                for (int i = argcount; i < args.Length; i++)
+                {
+                    computers.Add(args[i]);
+                }
+            }
+            // now that we've set command line options and obtained a list of computers, we need
+            // to select and enter a runtime mode
+            switch (mode)
+            {
+
+                case "shares":
+                    GetAllShares(computers, pubOnly, grepable);
+                    break;
+                case "versions":
+                    GetComputerVersions(computers);
+                    break;
+                case "ips":
+                    GetComputerAddresses(computers);
+                    break;
+                default:
+                    // default to error message if no mode selected
+                    Console.WriteLine("Error: Not enough arguments. Please pass \"ips\" or \"shares\".");
+                    break;
             }
         }
     }
